@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OpenPDF Editor - Full Browser PDF Suite</title>
+    
+    <!-- Libraries (CDN) -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.0/font/bootstrap-icons.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+    <script src="https://unpkg.com/pdf-lib@1.17.1/dist/pdf-lib.min.js"></script>
+    <script src="https://unpkg.com/fabric@5.3.0/dist/fabric.min.js"></script>
+    <script src="https://unpkg.com/@pdf-lib/fontkit@0.0.4/dist/fontkit.umd.min.js"></script>
+
+    <style>
+        :root {
+            --toolbar-height: 56px;
+            --sidebar-width: 240px;
+            --bg-viewer: #525659;
+        }
+        body, html { height: 100%; overflow: hidden; background: var(--bg-viewer); }
+        
+        /* Toolbar */
+        .pdf-toolbar {
+            height: var(--toolbar-height);
+            background: #323639;
+            color: white;
+            z-index: 1050;
+        }
+        .tool-btn {
+            color: #ccc;
+            border-radius: 4px;
+            padding: 6px 10px;
+            transition: all 0.2s;
+        }
+        .tool-btn:hover { color: white; background: rgba(255,255,255,0.1); }
+        .tool-btn.active { color: #00a8ff; background: rgba(0,168,255,0.1); }
+
+        /* Workspace */
+        #workspace {
+            display: flex;
+            height: calc(100% - var(--toolbar-height));
+            margin-top: var(--toolbar-height);
+        }
+        #sidebar {
+            width: var(--sidebar-width);
+            background: #202124;
+            color: #ddd;
+            overflow-y: auto;
+            border-right: 1px solid #333;
+        }
+        #viewer-container {
+            flex-grow: 1;
+            overflow: auto;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 20px;
+            scroll-behavior: smooth;
+        }
+
+        /* Page Rendering */
+        .page-wrapper {
+            position: relative;
+            box-shadow: 0 0 10px rgba(0,0,0,0.5);
+            margin-bottom: 30px;
+            background: white;
+        }
+        canvas.pdf-canvas { display: block; }
+        .fabric-canvas-container {
+            position: absolute;
+            top: 0; left: 0;
+            z-index: 2;
+        }
+
+        /* Thumbnails */
+        .thumb-item {
+            padding: 10px;
+            cursor: pointer;
+            text-align: center;
+            border-bottom: 1px solid #333;
+        }
+        .thumb-item:hover { background: #2a2b2e; }
+        .thumb-item.active { background: #3c4043; border-left: 4px solid #00a8ff; }
+        .thumb-canvas { width: 100%; height: auto; border: 1px solid #444; }
+
+        /* Loader */
+        #loader {
+            position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(0,0,0,0.5); display: none;
+            justify-content: center; align-items: center; z-index: 2000;
+        }
+    </style>
+</head>
+<body>
+
+<!-- Toolbar -->
+<nav class="pdf-toolbar fixed-top d-flex align-items-center justify-content-between px-3">
+    <div class="d-flex align-items-center">
+        <input type="file" id="file-input" hidden accept=".pdf">
+        <button class="btn tool-btn me-2" onclick="document.getElementById('file-input').click()">
+            <i class="bi bi-folder2-open"></i> Open
+        </button>
+        <div class="vr mx-2 bg-secondary"></div>
+        <button class="btn tool-btn" id="tool-select" title="Select (V)"><i class="bi bi-cursor"></i></button>
+        <button class="btn tool-btn" id="tool-text" title="Text (T)"><i class="bi bi-type"></i></button>
+        <button class="btn tool-btn" id="tool-draw" title="Draw (D)"><i class="bi bi-pencil"></i></button>
+        <button class="btn tool-btn" id="tool-rect" title="Rectangle (R)"><i class="bi bi-square"></i></button>
+        <button class="btn tool-btn" id="tool-circle" title="Circle (C)"><i class="bi bi-circle"></i></button>
+    </div>
+
+    <div class="d-flex align-items-center">
+        <button class="btn tool-btn" onclick="zoomIn()"><i class="bi bi-zoom-in"></i></button>
+        <span class="mx-2" id="zoom-label">100%</span>
+        <button class="btn tool-btn" onclick="zoomOut()"><i class="bi bi-zoom-out"></i></button>
+        <div class="vr mx-2 bg-secondary"></div>
+        <button class="btn tool-btn" id="undo-btn" title="Undo (Ctrl+Z)"><i class="bi bi-arrow-counterclockwise"></i></button>
+        <button class="btn tool-btn" id="redo-btn" title="Redo (Ctrl+Y)"><i class="bi bi-arrow-clockwise"></i></button>
+    </div>
+
+    <div class="d-flex align-items-center">
+        <button class="btn btn-primary btn-sm px-3" id="save-btn">
+            <i class="bi bi-download"></i> Save PDF
+        </button>
+    </div>
+</nav>
+
+<div id="workspace">
+    <!-- Sidebar / Thumbnails -->
+    <div id="sidebar">
+        <div class="p-2 border-bottom text-uppercase small fw-bold">Pages</div>
+        <div id="thumbnail-list"></div>
+    </div>
+
+    <!-- Main Viewer -->
+    <div id="viewer-container">
+        <div id="pdf-viewer"></div>
+    </div>
+</div>
+
+<div id="loader"><div class="spinner-border text-light"></div></div>
+
+<script>
+    const { PDFDocument, rgb, degrees, StandardFonts } = PDFLib;
+    pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+    let pdfDoc = null;
+    let pagesData = [];
+    let scale = 1.0;
+    let currentTool = 'select';
+    let undoStack = [];
+    let redoStack = [];
+
+    // --- Initialization ---
+
+    document.getElementById('file-input').onchange = async (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        showLoader(true);
+        const arrayBuffer = await file.arrayBuffer();
+        await loadPDF(arrayBuffer);
+        showLoader(false);
+    };
+
+    async function loadPDF(buffer) {
+        const pdf = await pdfjsLib.getDocument({ data: buffer }).promise;
+        pdfDoc = await PDFDocument.load(buffer);
+        pdfDoc.registerFontkit(fontkit);
+        
+        pagesData = [];
+        document.getElementById('pdf-viewer').innerHTML = '';
+        document.getElementById('thumbnail-list').innerHTML = '';
+
+        for (let i = 1; i <= pdf.numPages; i++) {
+            const page = await pdf.getPage(i);
+            const wrapper = createPageWrapper(i);
+            await renderPage(page, wrapper, i);
+            await renderThumbnail(page, i);
+        }
+    }
+
+    function createPageWrapper(pageNumber) {
+        const container = document.getElementById('pdf-viewer');
+        const wrapper = document.createElement('div');
+        wrapper.className = 'page-wrapper';
+        wrapper.id = `page-wrapper-${pageNumber}`;
+        container.appendChild(wrapper);
+        return wrapper;
+    }
+
+    async function renderPage(page, wrapper, pageNum) {
+        const viewport = page.getViewport({ scale });
+        const canvas = document.createElement('canvas');
+        canvas.className = 'pdf-canvas';
+        canvas.height = viewport.height;
+        canvas.width = viewport.width;
+        wrapper.appendChild(canvas);
+
+        const renderContext = { canvasContext: canvas.getContext('2d'), viewport };
+        await page.render(renderContext).promise;
+
+        // Create Fabric.js Overlay
+        const fabricCanvas = new fabric.Canvas(document.createElement('canvas'), {
+            width: viewport.width,
+            height: viewport.height,
+            selection: true
+        });
+        
+        const fContainer = document.createElement('div');
+        fContainer.className = 'fabric-canvas-container';
+        fContainer.appendChild(fabricCanvas.getElement().parentElement);
+        wrapper.appendChild(fContainer);
+
+        pagesData[pageNum - 1] = { page, fabricCanvas, viewport };
+        
+        fabricCanvas.on('object:added', () => saveState());
+        setupToolListeners(fabricCanvas);
+    }
+
+    async function renderThumbnail(page, pageNum) {
+        const viewport = page.getViewport({ scale: 0.2 });
+        const canvas = document.createElement('canvas');
+        canvas.className = 'thumb-canvas';
+        canvas.height = viewport.height;
+        canvas.width = viewport.width;
+        
+        await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
+        
+        const item = document.createElement('div');
+        item.className = 'thumb-item';
+        item.innerHTML = `<small>Page ${pageNum}</small>`;
+        item.prepend(canvas);
+        item.onclick = () => document.getElementById(`page-wrapper-${pageNum}`).scrollIntoView();
+        document.getElementById('thumbnail-list').appendChild(item);
+    }
+
+    // --- Tool Management ---
+
+    function setupToolListeners(fCanvas) {
+        fCanvas.on('mouse:down', (opt) => {
+            if (currentTool === 'text' && !opt.target) {
+                const text = new fabric.IText('Type here...', {
+                    left: opt.pointer.x,
+                    top: opt.pointer.y,
+                    fontSize: 20,
+                    fontFamily: 'Helvetica',
+                    fill: '#000'
+                });
+                fCanvas.add(text);
+                fCanvas.setActiveObject(text);
+                setTool('select');
+            }
+        });
+    }
+
+    function setTool(tool) {
+        currentTool = tool;
+        document.querySelectorAll('.tool-btn').forEach(btn => btn.classList.remove('active'));
+        document.getElementById(`tool-${tool}`)?.classList.add('active');
+
+        pagesData.forEach(p => {
+            p.fabricCanvas.isDrawingMode = (tool === 'draw');
+            p.fabricCanvas.selection = (tool === 'select');
+            p.fabricCanvas.forEachObject(obj => {
+                obj.selectable = (tool === 'select');
+                obj.evented = (tool === 'select');
+            });
+        });
+    }
+
+    document.getElementById('tool-select').onclick = () => setTool('select');
+    document.getElementById('tool-text').onclick = () => setTool('text');
+    document.getElementById('tool-draw').onclick = () => setTool('draw');
+    document.getElementById('tool-rect').onclick = () => {
+        const active = pagesData[0].fabricCanvas; // Simplified: adds to first page for demo logic
+        active.add(new fabric.Rect({ left: 100, top: 100, width: 100, height: 60, fill: 'transparent', stroke: 'red', strokeWidth: 2 }));
+        setTool('select');
+    };
+
+    // --- Exporting ---
+
+    document.getElementById('save-btn').onclick = async () => {
+        showLoader(true);
+        const outDoc = await PDFDocument.create();
+        const existingPages = await outDoc.copyPages(pdfDoc, pdfDoc.getPageIndices());
+        
+        for (let i = 0; i < existingPages.length; i++) {
+            const page = outDoc.addPage(existingPages[i]);
+            const fCanvas = pagesData[i].fabricCanvas;
+            const pdfPage = pdfDoc.getPages()[i];
+            const { width, height } = pdfPage.getSize();
+
+            // Coordinate conversion factor
+            const factorX = width / fCanvas.width;
+            const factorY = height / fCanvas.height;
+
+            for (const obj of fCanvas.getObjects()) {
+                if (obj.type === 'i-text' || obj.type === 'text') {
+                    page.drawText(obj.text, {
+                        x: obj.left * factorX,
+                        y: height - (obj.top * factorY) - (obj.fontSize * factorY),
+                        size: obj.fontSize * factorY,
+                        color: hexToRgb(obj.fill)
+                    });
+                } else if (obj.type === 'rect') {
+                    page.drawRectangle({
+                        x: obj.left * factorX,
+                        y: height - (obj.top * factorY) - (obj.height * obj.scaleY * factorY),
+                        width: obj.width * obj.scaleX * factorX,
+                        height: obj.height * obj.scaleY * factorY,
+                        borderColor: hexToRgb(obj.stroke),
+                        borderWidth: obj.strokeWidth * factorX
+                    });
+                }
+                // Note: Paths (drawing) require path parsing to page.drawSvgPath
+            }
+        }
+
+        const pdfBytes = await outDoc.save();
+        download(pdfBytes, "edited_document.pdf", "application/pdf");
+        showLoader(false);
+    };
+
+    // --- Helpers ---
+
+    function showLoader(show) { document.getElementById('loader').style.display = show ? 'flex' : 'none'; }
+
+    function download(data, filename, type) {
+        const file = new Blob([data], { type: type });
+        const a = document.createElement("a"), url = URL.createObjectURL(file);
+        a.href = url; a.download = filename;
+        document.body.appendChild(a); a.click();
+        setTimeout(() => { document.body.removeChild(a); window.URL.revokeObjectURL(url); }, 0);
+    }
+
+    function hexToRgb(hex) {
+        if (!hex || hex === 'transparent') return rgb(0,0,0);
+        const result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
+        return result ? rgb(parseInt(result[1], 16)/255, parseInt(result[2], 16)/255, parseInt(result[3], 16)/255) : rgb(0,0,0);
+    }
+
+    function zoomIn() { scale += 0.2; updateZoom(); }
+    function zoomOut() { if (scale > 0.5) scale -= 0.2; updateZoom(); }
+    function updateZoom() { 
+        document.getElementById('zoom-label').innerText = Math.round(scale * 100) + '%';
+        // Re-rendering would be required here for full zoom support
+    }
+
+    function saveState() {
+        // Logic for Undo/Redo by serializing fabric canvases
+    }
+
+    // Keyboard Shortcuts
+    window.addEventListener('keydown', (e) => {
+        if (e.ctrlKey && e.key === 's') { e.preventDefault(); document.getElementById('save-btn').click(); }
+        if (e.key === 't') setTool('text');
+        if (e.key === 'v') setTool('select');
+        if (e.key === 'd') setTool('draw');
+    });
+
+</script>
+</body>
+</html>
